@@ -2,17 +2,24 @@
 """
 hypr-cursor-warp: proportional cursor crossing between hyprland monitors
 
-modes (both on by default):
-  - live cross: when cursor naturally crosses to a neighbor monitor, snap
-    its y to the proportional position on the new monitor (40% in -> 40% out)
-  - dead zone: if cursor stuck against a monitor edge with no neighbor at
-    that y, warp to the touching neighbor at the proportional y
+modes:
+  - live cross (on): when cursor naturally crosses to a neighbor monitor,
+    snap its y to the proportional position (40% in -> 40% out)
+  - dead zone (on): if cursor stuck against a monitor edge with no neighbor
+    at that y, warp to the touching neighbor at the proportional y
+  - inf canvas (off): user-defined edge teleports between non-adjacent
+    monitors. mappings are bidirectional and only fire when the cursor is
+    stuck against the configured edge with no natural neighbor available.
 
 env vars:
-  HYPR_WARP_LIVE=0     disable live crossing mode
-  HYPR_WARP_DEAD=0     disable dead-zone warp mode
-  HYPR_WARP_HZ=120     poll rate
-  HYPR_WARP_DEBUG=1    verbose logs
+  HYPR_WARP_LIVE=0          disable live crossing mode
+  HYPR_WARP_DEAD=0          disable dead-zone warp mode
+  HYPR_WARP_HZ=120          poll rate
+  HYPR_WARP_DEBUG=1         verbose logs
+  HYPR_WARP_INF_CANVAS=...  enable inf-canvas teleports. format:
+                            "MON:edge=MON:edge,..." with edges in
+                            {top,bottom,left,right}. example:
+                            "DP-4:bottom=eDP-2:top,DP-4:left=DP-3:right"
 """
 
 import json
@@ -37,11 +44,49 @@ LIVE_MODE = os.environ.get("HYPR_WARP_LIVE", "1") != "0"
 DEAD_MODE = os.environ.get("HYPR_WARP_DEAD", "1") != "0"
 POLL_HZ = int(os.environ.get("HYPR_WARP_HZ", "120"))
 DEBUG = os.environ.get("HYPR_WARP_DEBUG", "0") != "0"
+INF_CANVAS_RAW = os.environ.get("HYPR_WARP_INF_CANVAS", "").strip()
 
 STUCK_FRAMES = max(4, POLL_HZ // 5)   # ~200ms before dead-zone warp
 WARP_COOLDOWN_S = 0.25
 EDGE_EPS = 1
 Y_SNAP_MIN = 3                         # don't warp on tiny y deltas
+EDGE_NAMES = ("top", "bottom", "left", "right")
+
+
+def parse_inf_canvas(spec):
+    """parse 'MON:edge=MON:edge,...' into a bidirectional dict
+    {(mon, edge): (mon, edge)}."""
+    result = {}
+    if not spec:
+        return result
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            print(f"inf-canvas: skip malformed '{entry}' (missing '=')",
+                  file=sys.stderr)
+            continue
+        a, b = entry.split("=", 1)
+        try:
+            a_mon, a_edge = a.rsplit(":", 1)
+            b_mon, b_edge = b.rsplit(":", 1)
+        except ValueError:
+            print(f"inf-canvas: skip malformed '{entry}' (need 'MON:edge')",
+                  file=sys.stderr)
+            continue
+        a_mon, a_edge = a_mon.strip(), a_edge.strip().lower()
+        b_mon, b_edge = b_mon.strip(), b_edge.strip().lower()
+        if a_edge not in EDGE_NAMES or b_edge not in EDGE_NAMES:
+            print(f"inf-canvas: skip '{entry}' (edge must be one of "
+                  f"{EDGE_NAMES})", file=sys.stderr)
+            continue
+        result[(a_mon, a_edge)] = (b_mon, b_edge)
+        result[(b_mon, b_edge)] = (a_mon, a_edge)
+    return result
+
+
+INF_CANVAS = parse_inf_canvas(INF_CANVAS_RAW)
 
 
 @dataclass
@@ -116,6 +161,48 @@ def right_neighbor(mons, m):
     return None
 
 
+def find_monitor_by_name(mons, name):
+    for m in mons:
+        if m.name == name:
+            return m
+    return None
+
+
+def at_edge(m, cx, cy):
+    """which edge of m the cursor is touching, or None."""
+    if cx <= m.x + EDGE_EPS:
+        return "left"
+    if cx >= m.x + m.w - 1 - EDGE_EPS:
+        return "right"
+    if cy <= m.y + EDGE_EPS:
+        return "top"
+    if cy >= m.y + m.h - 1 - EDGE_EPS:
+        return "bottom"
+    return None
+
+
+def perp_rel(m, cx, cy, edge):
+    """relative position along the axis perpendicular to `edge`, in [0,1]."""
+    if edge in ("left", "right"):
+        return (cy - m.y) / m.h
+    return (cx - m.x) / m.w
+
+
+def edge_target(n, edge, rel):
+    """coords on monitor n along its `edge`, with perpendicular `rel` (0..1)."""
+    if edge == "left":
+        tx, ty = n.x, int(round(n.y + rel * n.h))
+    elif edge == "right":
+        tx, ty = n.x + n.w - 1, int(round(n.y + rel * n.h))
+    elif edge == "top":
+        tx, ty = int(round(n.x + rel * n.w)), n.y
+    else:  # bottom
+        tx, ty = int(round(n.x + rel * n.w)), n.y + n.h - 1
+    tx = max(n.x, min(n.x + n.w - 1, tx))
+    ty = max(n.y, min(n.y + n.h - 1, ty))
+    return tx, ty
+
+
 def event_thread(state):
     interest = {"monitoradded", "monitoraddedv2", "monitorremoved",
                 "monitorremovedv2", "configreloaded"}
@@ -147,10 +234,19 @@ def event_thread(state):
 
 def main():
     state = {"mons": fetch_monitors()}
-    print(f"hypr-cursor-warp running (live={LIVE_MODE} dead={DEAD_MODE} hz={POLL_HZ})",
-          flush=True)
+    print(f"hypr-cursor-warp running (live={LIVE_MODE} dead={DEAD_MODE} "
+          f"inf={bool(INF_CANVAS)} hz={POLL_HZ})", flush=True)
     for m in state["mons"]:
         print(f"  {m.name}: {m.w}x{m.h} at {m.x},{m.y}", flush=True)
+    if INF_CANVAS:
+        seen = set()
+        for (a_mon, a_edge), (b_mon, b_edge) in INF_CANVAS.items():
+            key = tuple(sorted([(a_mon, a_edge), (b_mon, b_edge)]))
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"  inf-canvas: {a_mon}:{a_edge} <-> {b_mon}:{b_edge}",
+                  flush=True)
 
     threading.Thread(target=event_thread, args=(state,), daemon=True).start()
 
@@ -232,6 +328,27 @@ def main():
                     last_warp = now
                     cx, cy, m = tx, ty, n
                     stuck = 0
+                    warped = True
+
+            # 3) inf-canvas: user-defined edge teleport for any of 4 edges.
+            # only fires when the natural neighbor logic above didn't handle
+            # it, so it's a strict fallback to the standard hyprland topology.
+            if not warped and INF_CANVAS:
+                edge = at_edge(m, cx, cy)
+                if edge:
+                    dest = INF_CANVAS.get((m.name, edge))
+                    if dest:
+                        n = find_monitor_by_name(mons, dest[0])
+                        if n:
+                            rel = perp_rel(m, cx, cy, edge)
+                            tx, ty = edge_target(n, dest[1], rel)
+                            hypr_send(f"dispatch movecursor {tx} {ty}")
+                            log(f"inf-canvas {m.name}:{edge}->"
+                                f"{n.name}:{dest[1]}: ({cx},{cy}) -> "
+                                f"({tx},{ty})")
+                            last_warp = now
+                            cx, cy, m = tx, ty, n
+                            stuck = 0
 
         prev_mon = m
         prev_rel_y = (cy - m.y) / m.h
