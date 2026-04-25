@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+hypr-cursor-warp: proportional cursor crossing between hyprland monitors
+
+modes (both on by default):
+  - live cross: when cursor naturally crosses to a neighbor monitor, snap
+    its y to the proportional position on the new monitor (40% in -> 40% out)
+  - dead zone: if cursor stuck against a monitor edge with no neighbor at
+    that y, warp to the touching neighbor at the proportional y
+
+env vars:
+  HYPR_WARP_LIVE=0     disable live crossing mode
+  HYPR_WARP_DEAD=0     disable dead-zone warp mode
+  HYPR_WARP_HZ=120     poll rate
+  HYPR_WARP_DEBUG=1    verbose logs
+"""
+
+import json
+import os
+import socket
+import sys
+import threading
+import time
+from dataclasses import dataclass
+
+
+SIG = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+if not SIG:
+    print("HYPRLAND_INSTANCE_SIGNATURE not set; is hyprland running?", file=sys.stderr)
+    sys.exit(1)
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+CMD_SOCK = f"{RUNTIME}/hypr/{SIG}/.socket.sock"
+EVT_SOCK = f"{RUNTIME}/hypr/{SIG}/.socket2.sock"
+
+LIVE_MODE = os.environ.get("HYPR_WARP_LIVE", "1") != "0"
+DEAD_MODE = os.environ.get("HYPR_WARP_DEAD", "1") != "0"
+POLL_HZ = int(os.environ.get("HYPR_WARP_HZ", "120"))
+DEBUG = os.environ.get("HYPR_WARP_DEBUG", "0") != "0"
+
+STUCK_FRAMES = max(4, POLL_HZ // 5)   # ~200ms before dead-zone warp
+WARP_COOLDOWN_S = 0.25
+EDGE_EPS = 1
+Y_SNAP_MIN = 3                         # don't warp on tiny y deltas
+
+
+@dataclass
+class Monitor:
+    name: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+def log(*a):
+    if DEBUG:
+        print(*a, flush=True)
+
+
+def hypr_send(cmd: str) -> str:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(CMD_SOCK)
+        s.sendall(cmd.encode())
+        out = bytearray()
+        while True:
+            c = s.recv(4096)
+            if not c:
+                break
+            out += c
+        return out.decode()
+
+
+def fetch_monitors():
+    mons = []
+    for m in json.loads(hypr_send("j/monitors")):
+        if m.get("disabled"):
+            continue
+        w, h = m["width"], m["height"]
+        # transforms 1/3/5/7 rotate by 90deg, swapping effective dimensions
+        if m.get("transform", 0) % 2 == 1:
+            w, h = h, w
+        mons.append(Monitor(m["name"], m["x"], m["y"], w, h))
+    return mons
+
+
+def fetch_cursor():
+    raw = hypr_send("cursorpos").strip()
+    if "," not in raw:
+        return None
+    try:
+        x, y = raw.split(",")
+        return int(x.strip()), int(y.strip())
+    except ValueError:
+        return None
+
+
+def find_monitor(mons, x, y):
+    for m in mons:
+        if m.x <= x < m.x + m.w and m.y <= y < m.y + m.h:
+            return m
+    return None
+
+
+def left_neighbor(mons, m):
+    for n in mons:
+        if n is not m and n.x + n.w == m.x:
+            return n
+    return None
+
+
+def right_neighbor(mons, m):
+    for n in mons:
+        if n is not m and n.x == m.x + m.w:
+            return n
+    return None
+
+
+def event_thread(state):
+    interest = {"monitoradded", "monitoraddedv2", "monitorremoved",
+                "monitorremovedv2", "configreloaded"}
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(EVT_SOCK)
+                buf = b""
+                while True:
+                    c = s.recv(4096)
+                    if not c:
+                        break
+                    buf += c
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        evt = line.decode().split(">>", 1)[0]
+                        if evt in interest:
+                            try:
+                                state["mons"] = fetch_monitors()
+                                print(f"layout reload: " + ", ".join(
+                                    f"{m.name} {m.w}x{m.h}@{m.x},{m.y}"
+                                    for m in state["mons"]), flush=True)
+                            except Exception as e:
+                                print(f"reload failed: {e}", flush=True)
+        except Exception as e:
+            print(f"event socket error: {e}; retry in 1s", flush=True)
+            time.sleep(1)
+
+
+def main():
+    state = {"mons": fetch_monitors()}
+    print(f"hypr-cursor-warp running (live={LIVE_MODE} dead={DEAD_MODE} hz={POLL_HZ})",
+          flush=True)
+    for m in state["mons"]:
+        print(f"  {m.name}: {m.w}x{m.h} at {m.x},{m.y}", flush=True)
+
+    threading.Thread(target=event_thread, args=(state,), daemon=True).start()
+
+    dt = 1.0 / POLL_HZ
+    prev_mon = None
+    prev_rel_y = None
+    last_pos = None
+    stuck = 0
+    last_warp = 0.0
+
+    while True:
+        time.sleep(dt)
+        try:
+            pos = fetch_cursor()
+        except Exception as e:
+            log(f"cursor read failed: {e}")
+            time.sleep(0.5)
+            continue
+        if pos is None:
+            continue
+
+        cx, cy = pos
+        mons = state["mons"]
+        m = find_monitor(mons, cx, cy)
+        now = time.time()
+        cooldown = (now - last_warp) < WARP_COOLDOWN_S
+
+        if m is None:
+            prev_mon = None
+            prev_rel_y = None
+            last_pos = pos
+            stuck = 0
+            continue
+
+        # 1) live cross: detect monitor change since last poll
+        if (LIVE_MODE and not cooldown and prev_mon is not None
+                and prev_mon.name != m.name and prev_rel_y is not None):
+            target_y = int(round(m.y + prev_rel_y * m.h))
+            target_y = max(m.y, min(m.y + m.h - 1, target_y))
+            if abs(target_y - cy) >= Y_SNAP_MIN:
+                hypr_send(f"dispatch movecursor {cx} {target_y}")
+                log(f"cross {prev_mon.name}->{m.name} rel={prev_rel_y:.2f}: "
+                    f"y {cy} -> {target_y}")
+                last_warp = now
+                cy = target_y
+
+        # 2) dead-zone warp: cursor stuck at edge with no neighbor at this y
+        if pos == last_pos:
+            stuck += 1
+        else:
+            stuck = 1
+        last_pos = (cx, cy)
+
+        if (DEAD_MODE and not cooldown and stuck >= STUCK_FRAMES):
+            rel_y = (cy - m.y) / m.h
+            warped = False
+
+            if cx <= m.x + EDGE_EPS:
+                n = left_neighbor(mons, m)
+                if n and not (n.y <= cy < n.y + n.h):
+                    tx = n.x + n.w - 1
+                    ty = int(round(n.y + rel_y * n.h))
+                    ty = max(n.y, min(n.y + n.h - 1, ty))
+                    hypr_send(f"dispatch movecursor {tx} {ty}")
+                    log(f"deadzone L {m.name}->{n.name}: ({cx},{cy}) -> ({tx},{ty})")
+                    last_warp = now
+                    cx, cy, m = tx, ty, n
+                    stuck = 0
+                    warped = True
+
+            if not warped and cx >= m.x + m.w - 1 - EDGE_EPS:
+                n = right_neighbor(mons, m)
+                if n and not (n.y <= cy < n.y + n.h):
+                    tx = n.x
+                    ty = int(round(n.y + rel_y * n.h))
+                    ty = max(n.y, min(n.y + n.h - 1, ty))
+                    hypr_send(f"dispatch movecursor {tx} {ty}")
+                    log(f"deadzone R {m.name}->{n.name}: ({cx},{cy}) -> ({tx},{ty})")
+                    last_warp = now
+                    cx, cy, m = tx, ty, n
+                    stuck = 0
+
+        prev_mon = m
+        prev_rel_y = (cy - m.y) / m.h
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
