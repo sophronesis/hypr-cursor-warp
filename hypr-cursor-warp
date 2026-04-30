@@ -257,8 +257,8 @@ def main():
     dt = 1.0 / POLL_HZ
     prev_mon = None
     prev_rel_y = None
-    last_pos = None
-    stuck = 0
+    prev_edge_pin = None    # (mon_name, edge) currently being held against
+    edge_stuck = 0
     last_warp = 0.0
 
     while True:
@@ -281,8 +281,8 @@ def main():
         if m is None:
             prev_mon = None
             prev_rel_y = None
-            last_pos = pos
-            stuck = 0
+            prev_edge_pin = None
+            edge_stuck = 0
             continue
 
         # 1) live cross: detect monitor change since last poll
@@ -297,14 +297,20 @@ def main():
                 last_warp = now
                 cy = target_y
 
-        # 2) dead-zone warp: cursor stuck at edge with no neighbor at this y
-        if pos == last_pos:
-            stuck += 1
+        # 2) dead-zone warp: cursor pinned against an edge for STUCK_FRAMES.
+        # tracks edge contact (not exact position) so a real mouse held
+        # against an edge - which jitters along the parallel axis - still
+        # qualifies as stuck. exact-position tracking failed for mice but
+        # worked for keyboard mouse-emulation that stops between keypresses.
+        edge_now = at_edge(m, cx, cy)
+        pin_now = (m.name, edge_now) if edge_now else None
+        if pin_now is not None and pin_now == prev_edge_pin:
+            edge_stuck += 1
         else:
-            stuck = 1
-        last_pos = (cx, cy)
+            edge_stuck = 1 if pin_now else 0
+        prev_edge_pin = pin_now
 
-        if (DEAD_MODE and not cooldown and stuck >= STUCK_FRAMES):
+        if (DEAD_MODE and not cooldown and edge_stuck >= STUCK_FRAMES):
             rel_y = (cy - m.y) / m.h
             warped = False
 
@@ -318,7 +324,8 @@ def main():
                     log(f"deadzone L {m.name}->{n.name}: ({cx},{cy}) -> ({tx},{ty})")
                     last_warp = now
                     cx, cy, m = tx, ty, n
-                    stuck = 0
+                    edge_stuck = 0
+                    prev_edge_pin = None
                     warped = True
 
             if not warped and cx >= m.x + m.w - 1 - EDGE_EPS:
@@ -331,7 +338,8 @@ def main():
                     log(f"deadzone R {m.name}->{n.name}: ({cx},{cy}) -> ({tx},{ty})")
                     last_warp = now
                     cx, cy, m = tx, ty, n
-                    stuck = 0
+                    edge_stuck = 0
+                    prev_edge_pin = None
                     warped = True
 
             # 3) inf-canvas: user-defined edge teleport for any of 4 edges.
@@ -352,7 +360,8 @@ def main():
                                 f"({tx},{ty})")
                             last_warp = now
                             cx, cy, m = tx, ty, n
-                            stuck = 0
+                            edge_stuck = 0
+                            prev_edge_pin = None
 
         prev_mon = m
         prev_rel_y = (cy - m.y) / m.h
