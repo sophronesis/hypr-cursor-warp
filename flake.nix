@@ -12,7 +12,7 @@
       packages = forAllSystems (system: pkgs: {
         default = pkgs.stdenvNoCC.mkDerivation {
           pname = "hypr-cursor-warp";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
 
           nativeBuildInputs = [ pkgs.makeWrapper ];

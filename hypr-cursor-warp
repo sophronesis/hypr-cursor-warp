@@ -189,15 +189,17 @@ def perp_rel(m, cx, cy, edge):
 
 
 def edge_target(n, edge, rel):
-    """coords on monitor n along its `edge`, with perpendicular `rel` (0..1)."""
+    """coords on monitor n along its `edge`, with perpendicular `rel` (0..1).
+    insets by 1px from the destination edge so the cursor lands fully inside
+    the new monitor and doesn't flicker against the boundary."""
     if edge == "left":
-        tx, ty = n.x, int(round(n.y + rel * n.h))
+        tx, ty = n.x + 1, int(round(n.y + rel * n.h))
     elif edge == "right":
-        tx, ty = n.x + n.w - 1, int(round(n.y + rel * n.h))
+        tx, ty = n.x + n.w - 2, int(round(n.y + rel * n.h))
     elif edge == "top":
-        tx, ty = int(round(n.x + rel * n.w)), n.y
+        tx, ty = int(round(n.x + rel * n.w)), n.y + 1
     else:  # bottom
-        tx, ty = int(round(n.x + rel * n.w)), n.y + n.h - 1
+        tx, ty = int(round(n.x + rel * n.w)), n.y + n.h - 2
     tx = max(n.x, min(n.x + n.w - 1, tx))
     ty = max(n.y, min(n.y + n.h - 1, ty))
     return tx, ty
@@ -307,7 +309,7 @@ def main():
             if cx <= m.x + EDGE_EPS:
                 n = left_neighbor(mons, m)
                 if n and not (n.y <= cy < n.y + n.h):
-                    tx = n.x + n.w - 1
+                    tx = n.x + n.w - 2
                     ty = int(round(n.y + rel_y * n.h))
                     ty = max(n.y, min(n.y + n.h - 1, ty))
                     hypr_send(f"dispatch movecursor {tx} {ty}")
@@ -320,7 +322,7 @@ def main():
             if not warped and cx >= m.x + m.w - 1 - EDGE_EPS:
                 n = right_neighbor(mons, m)
                 if n and not (n.y <= cy < n.y + n.h):
-                    tx = n.x
+                    tx = n.x + 1
                     ty = int(round(n.y + rel_y * n.h))
                     ty = max(n.y, min(n.y + n.h - 1, ty))
                     hypr_send(f"dispatch movecursor {tx} {ty}")
