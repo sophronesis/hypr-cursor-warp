@@ -49,6 +49,8 @@ INF_CANVAS_RAW = os.environ.get("HYPR_WARP_INF_CANVAS", "").strip()
 STUCK_FRAMES = max(4, POLL_HZ // 5)   # ~200ms before dead-zone warp
 WARP_COOLDOWN_S = 0.25
 EDGE_EPS = 1
+EDGE_INSET = EDGE_EPS + 1              # land outside the at-edge zone to
+                                       # avoid inf-canvas warp loops
 Y_SNAP_MIN = 3                         # don't warp on tiny y deltas
 EDGE_NAMES = ("top", "bottom", "left", "right")
 
@@ -190,16 +192,16 @@ def perp_rel(m, cx, cy, edge):
 
 def edge_target(n, edge, rel):
     """coords on monitor n along its `edge`, with perpendicular `rel` (0..1).
-    insets by 1px from the destination edge so the cursor lands fully inside
-    the new monitor and doesn't flicker against the boundary."""
+    insets by EDGE_INSET px from the destination edge so the cursor lands
+    outside the at-edge detection zone, preventing inf-canvas warp loops."""
     if edge == "left":
-        tx, ty = n.x + 1, int(round(n.y + rel * n.h))
+        tx, ty = n.x + EDGE_INSET, int(round(n.y + rel * n.h))
     elif edge == "right":
-        tx, ty = n.x + n.w - 2, int(round(n.y + rel * n.h))
+        tx, ty = n.x + n.w - 1 - EDGE_INSET, int(round(n.y + rel * n.h))
     elif edge == "top":
-        tx, ty = int(round(n.x + rel * n.w)), n.y + 1
+        tx, ty = int(round(n.x + rel * n.w)), n.y + EDGE_INSET
     else:  # bottom
-        tx, ty = int(round(n.x + rel * n.w)), n.y + n.h - 2
+        tx, ty = int(round(n.x + rel * n.w)), n.y + n.h - 1 - EDGE_INSET
     tx = max(n.x, min(n.x + n.w - 1, tx))
     ty = max(n.y, min(n.y + n.h - 1, ty))
     return tx, ty
@@ -309,7 +311,7 @@ def main():
             if cx <= m.x + EDGE_EPS:
                 n = left_neighbor(mons, m)
                 if n and not (n.y <= cy < n.y + n.h):
-                    tx = n.x + n.w - 2
+                    tx = n.x + n.w - 1 - EDGE_INSET
                     ty = int(round(n.y + rel_y * n.h))
                     ty = max(n.y, min(n.y + n.h - 1, ty))
                     hypr_send(f"dispatch movecursor {tx} {ty}")
@@ -322,7 +324,7 @@ def main():
             if not warped and cx >= m.x + m.w - 1 - EDGE_EPS:
                 n = right_neighbor(mons, m)
                 if n and not (n.y <= cy < n.y + n.h):
-                    tx = n.x + 1
+                    tx = n.x + EDGE_INSET
                     ty = int(round(n.y + rel_y * n.h))
                     ty = max(n.y, min(n.y + n.h - 1, ty))
                     hypr_send(f"dispatch movecursor {tx} {ty}")
